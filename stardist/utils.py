@@ -1,124 +1,33 @@
 from __future__ import print_function, unicode_literals, absolute_import, division
-from six.moves import range, zip, map, reduce, filter
 
 import numpy as np
 import warnings
+import os
+import datetime
+from tqdm import tqdm
+from zipfile import ZipFile, ZIP_DEFLATED
 from scipy.ndimage.morphology import distance_transform_edt, binary_fill_holes
 from scipy.ndimage.measurements import find_objects
-from skimage.draw import polygon
+from scipy.optimize import minimize_scalar
+from skimage.measure import regionprops
 from csbdeep.utils import _raise
+from csbdeep.utils.six import Path
+
+from .matching import matching_dataset
 
 
-_ocl_kernel = r"""
-#ifndef M_PI
-#define M_PI 3.141592653589793
-#endif
-
-__constant sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;
-
-inline float2 pol2cart(const float rho, const float phi) {
-    const float x = rho * cos(phi);
-    const float y = rho * sin(phi);
-    return (float2)(x,y);
-}
-
-__kernel void star_dist(__global float* dst, read_only image2d_t src) {
-
-    const int i = get_global_id(0), j = get_global_id(1);
-    const int Nx = get_global_size(0), Ny = get_global_size(1);
-
-    const float2 origin = (float2)(i,j);
-    const int value = read_imageui(src,sampler,origin).x;
-
-    if (value == 0) {
-        // background pixel -> nothing to do, write all zeros
-        for (int k = 0; k < N_RAYS; k++) {
-            dst[k + i*N_RAYS + j*N_RAYS*Nx] = 0;
-        }
-    } else {
-        float st_rays = (2*M_PI) / N_RAYS; // step size for ray angles
-        // for all rays
-        for (int k = 0; k < N_RAYS; k++) {
-            const float phi = k*st_rays; // current ray angle phi
-            const float2 dir = pol2cart(1,phi); // small vector in direction of ray
-            float2 offset = 0; // offset vector to be added to origin
-            // find radius that leaves current object
-            while (1) {
-                offset += dir;
-                const int offset_value = read_imageui(src,sampler,round(origin+offset)).x;
-                if (offset_value != value) {
-                    const float dist = sqrt(offset.x*offset.x + offset.y*offset.y);
-                    dst[k + i*N_RAYS + j*N_RAYS*Nx] = dist;
-                    break;
-                }
-            }
-        }
-    }
-
-}
-"""
+def gputools_available():
+    try:
+        import gputools
+    except:
+        return False
+    return True
 
 
-def _ocl_star_dist(a, n_rays=32):
-    from gputools import OCLProgram, OCLArray, OCLImage
-    (np.isscalar(n_rays) and 0 < int(n_rays)) or _raise(ValueError())
-    n_rays = int(n_rays)
-    src = OCLImage.from_array(a.astype(np.uint16,copy=False))
-    dst = OCLArray.empty(a.shape+(n_rays,), dtype=np.float32)
-    program = OCLProgram(src_str=_ocl_kernel, build_options=['-D', 'N_RAYS=%d' % n_rays])
-    program.run_kernel('star_dist', src.shape, None, dst.data, src)
-    return dst.get()
-
-
-def _cpp_star_dist(a, n_rays=32):
-    from .lib.stardist import c_star_dist
-    (np.isscalar(n_rays) and 0 < int(n_rays)) or _raise(ValueError())
-    return c_star_dist(a.astype(np.uint16,copy=False), int(n_rays))
-
-
-def _py_star_dist(a, n_rays=32):
-    (np.isscalar(n_rays) and 0 < int(n_rays)) or _raise(ValueError())
-    n_rays = int(n_rays)
-    a = a.astype(np.uint16,copy=False)
-    dst = np.empty(a.shape+(n_rays,),np.float32)
-
-    for i in range(a.shape[0]):
-        for j in range(a.shape[1]):
-            value = a[i,j]
-            if value == 0:
-                dst[i,j] = 0
-            else:
-                st_rays = np.float32((2*np.pi) / n_rays)
-                for k in range(n_rays):
-                    phi = np.float32(k*st_rays)
-                    dy = np.cos(phi)
-                    dx = np.sin(phi)
-                    x, y = np.float32(0), np.float32(0)
-
-                    while True:
-                        x += dx
-                        y += dy
-                        ii = int(round(i+x))
-                        jj = int(round(j+y))
-                        if (ii < 0 or ii >= a.shape[0] or
-                            jj < 0 or jj >= a.shape[1] or
-                            value != a[ii,jj]):
-                            dist = np.sqrt(x*x + y*y)
-                            dst[i,j,k] = dist
-                            break
-    return dst
-
-
-def star_dist(a, n_rays=32, opencl=False):
-    """'a' assumbed to be a label image with integer values that encode object ids. id 0 denotes background."""
-    if not _is_power_of_2(n_rays):
-        warnings.warn("not tested with 'n_rays' not being a power of 2.")
-    if opencl:
-        try:
-            return _ocl_star_dist(a,n_rays)
-        except:
-            pass
-    return _cpp_star_dist(a,n_rays)
+def path_absolute(path_relative):
+    """ Get absolute path to resource"""
+    base_path = os.path.abspath(os.path.dirname(__file__))
+    return os.path.join(base_path, path_relative)
 
 
 def _is_power_of_2(i):
@@ -127,51 +36,43 @@ def _is_power_of_2(i):
     return e == int(e)
 
 
-def ray_angles(n_rays=32):
-    return np.linspace(0,2*np.pi,n_rays,endpoint=False)
+def _normalize_grid(grid,n):
+    try:
+        grid = tuple(grid)
+        (len(grid) == n and
+         all(map(np.isscalar,grid)) and
+         all(map(_is_power_of_2,grid))) or _raise(TypeError())
+        return tuple(int(g) for g in grid)
+    except (TypeError, AssertionError):
+        raise ValueError("grid must be a list/tuple of length {n} with values that are power of 2".format(n=n))
 
 
-def dist_to_coord(rhos):
-    """convert from polar to cartesian coordinates for a single image (3-D array) or multiple images (4-D array)"""
-
-    is_single_image = rhos.ndim == 3
-    if is_single_image:
-        rhos = np.expand_dims(rhos,0)
-    assert rhos.ndim == 4
-
-    n_images,h,w,n_rays = rhos.shape
-    coord = np.empty((n_images,h,w,2,n_rays),dtype=rhos.dtype)
-
-    start = np.meshgrid(np.arange(h),np.arange(w), indexing='ij')
-    for i in range(2):
-        start[i] = start[i].reshape(1,h,w,1)
-        # start[i] = np.tile(start[i],(n_images,1,1,n_rays))
-        start[i] = np.broadcast_to(start[i],(n_images,h,w,n_rays))
-        coord[...,i,:] = start[i]
-
-    phis = ray_angles(n_rays).reshape(1,1,1,n_rays)
-
-    coord[...,0,:] += rhos * np.sin(phis) # row coordinate
-    coord[...,1,:] += rhos * np.cos(phis) # col coordinate
-
-    return coord[0] if is_single_image else coord
-
-
-def _edt_prob(lbl_img):
+def _edt_prob(lbl_img, anisotropy=None):
+    try:
+        from edt import edt as edt_func
+        dist_func = lambda img: edt_func(img>0, anisotropy=anisotropy)
+    except ImportError:
+        dist_func = lambda img: distance_transform_edt(img, sampling=anisotropy)
     prob = np.zeros(lbl_img.shape,np.float32)
     for l in (set(np.unique(lbl_img)) - set([0])):
         mask = lbl_img==l
-        edt = distance_transform_edt(mask)[mask]
-        prob[mask] = edt/np.max(edt)
+        edt = dist_func(mask)[mask]
+        prob[mask] = edt/(np.max(edt)+1e-10)
     return prob
 
 
-def edt_prob(lbl_img):
+def edt_prob(lbl_img, anisotropy=None):
     """Perform EDT on each labeled object and normalize."""
     def grow(sl,interior):
         return tuple(slice(s.start-int(w[0]),s.stop+int(w[1])) for s,w in zip(sl,interior))
     def shrink(interior):
         return tuple(slice(int(w[0]),(-1 if w[1] else None)) for w in interior)
+
+    try:
+        from edt import edt as edt_func
+        dist_func = lambda img: edt_func(img>0, anisotropy=anisotropy)
+    except ImportError:
+        dist_func = lambda img: distance_transform_edt(img, sampling=anisotropy)
     objects = find_objects(lbl_img)
     prob = np.zeros(lbl_img.shape,np.float32)
     for i,sl in enumerate(objects,1):
@@ -185,27 +86,9 @@ def edt_prob(lbl_img):
         shrink_slice = shrink(interior)
         grown_mask = lbl_img[grow(sl,interior)]==i
         mask = grown_mask[shrink_slice]
-        edt = distance_transform_edt(grown_mask)[shrink_slice][mask]
-        prob[sl][mask] = edt/np.max(edt)
+        edt = dist_func(grown_mask)[shrink_slice][mask]
+        prob[sl][mask] = edt/(np.max(edt)+1e-10)
     return prob
-
-
-def polygons_to_label(coord, prob, points, thr=-np.inf):
-    sh = coord.shape[:2]
-    lbl = np.zeros(sh,np.uint16)
-    # sort points with increasing probability
-    ind = np.argsort([ prob[p[0],p[1]] for p in points ])
-    points = points[ind]
-
-    i = 1
-    for p in points:
-        if prob[p[0],p[1]] < thr:
-            continue
-        rr,cc = polygon(coord[p[0],p[1],0], coord[p[0],p[1],1], sh)
-        lbl[rr,cc] = i
-        i += 1
-
-    return lbl
 
 
 def _fill_label_holes(lbl_img, **kwargs):
@@ -258,3 +141,115 @@ def sample_points(n_samples, mask, prob=None, b=2):
     points = points[0][ind], points[1][ind]
     points = np.stack(points,axis=-1)
     return points
+
+
+def calculate_extents(lbl, func=np.median):
+    """ Aggregate bounding box sizes of objects in label images. """
+    if isinstance(lbl,(tuple,list)) or (isinstance(lbl,np.ndarray) and lbl.ndim==4):
+        return func(np.stack([calculate_extents(_lbl,func) for _lbl in lbl], axis=0), axis=0)
+
+    n = lbl.ndim
+    n in (2,3) or _raise(ValueError("label image should be 2- or 3-dimensional (or pass a list of these)"))
+
+    regs = regionprops(lbl)
+    if len(regs) == 0:
+        return np.zeros(n)
+    else:
+        extents = np.array([np.array(r.bbox[n:])-np.array(r.bbox[:n]) for r in regs])
+        return func(extents, axis=0)
+
+
+def polyroi_bytearray(x,y,pos=None):
+    """ Byte array of polygon roi with provided x and y coordinates
+        See https://github.com/imagej/imagej1/blob/master/ij/io/RoiDecoder.java
+    """
+    def _int16(x):
+        return int(x).to_bytes(2, byteorder='big', signed=True)
+    def _uint16(x):
+        return int(x).to_bytes(2, byteorder='big', signed=False)
+    def _int32(x):
+        return int(x).to_bytes(4, byteorder='big', signed=True)
+
+    x = np.asarray(x).ravel()
+    y = np.asarray(y).ravel()
+    assert len(x) == len(y)
+    top, left, bottom, right = y.min(), x.min(), y.max(), x.max() # bbox
+
+    n_coords = len(x)
+    bytes_header = 64
+    bytes_total = bytes_header + n_coords*2*2
+    B = [0] * bytes_total
+    B[ 0: 4] = map(ord,'Iout')   # magic start
+    B[ 4: 6] = _int16(227)       # version
+    B[ 6: 8] = _int16(0)         # roi type (0 = polygon)
+    B[ 8:10] = _int16(top)       # bbox top
+    B[10:12] = _int16(left)      # bbox left
+    B[12:14] = _int16(bottom)    # bbox bottom
+    B[14:16] = _int16(right)     # bbox right
+    B[16:18] = _uint16(n_coords) # number of coordinates
+    if pos is not None:
+        B[56:60] = _int32(pos)   # position (C, Z, or T)
+
+    for i,(_x,_y) in enumerate(zip(x,y)):
+        xs = bytes_header + 2*i
+        ys = xs + 2*n_coords
+        B[xs:xs+2] = _int16(_x - left)
+        B[ys:ys+2] = _int16(_y - top)
+
+    return bytearray(B)
+
+
+def export_imagej_rois(fname, polygons, set_position=True, compression=ZIP_DEFLATED):
+    """ polygons assumed to be a list of arrays with shape (id,2,c) """
+
+    if isinstance(polygons,np.ndarray):
+        polygons = (polygons,)
+
+    fname = Path(fname)
+    if fname.suffix == '.zip':
+        fname = Path(fname.stem)
+
+    with ZipFile(str(fname)+'.zip', mode='w', compression=compression) as roizip:
+        for pos,polygroup in enumerate(polygons,start=1):
+            for i,poly in enumerate(polygroup,start=1):
+                roi = polyroi_bytearray(poly[1],poly[0], pos=(pos if set_position else None))
+                roizip.writestr('{pos:03d}_{i:03d}.roi'.format(pos=pos,i=i), roi)
+
+
+def optimize_threshold(Y, Yhat, model, nms_thresh, measure='accuracy', iou_threshs=[0.3,0.5,0.7], bracket=None, tol=1e-2, maxiter=20, verbose=1):
+    """ Tune prob_thresh for provided (fixed) nms_thresh to maximize matching score (for given measure and averaged over iou_threshs). """
+    np.isscalar(nms_thresh) or _raise(ValueError("nms_thresh must be a scalar"))
+    iou_threshs = [iou_threshs] if np.isscalar(iou_threshs) else iou_threshs
+    values = dict()
+
+    if bracket is None:
+        max_prob = max([np.max(prob) for prob, dist in Yhat])
+        bracket = max_prob/2, max_prob
+    # print("bracket =", bracket)
+
+    with tqdm(total=maxiter, disable=(verbose!=1), desc="NMS threshold = %g" % nms_thresh) as progress:
+
+        def fn(thr):
+            prob_thresh = np.clip(thr, *bracket)
+            value = values.get(prob_thresh)
+            if value is None:
+                Y_instances = [model._instances_from_prediction(y.shape, *prob_dist, prob_thresh=prob_thresh, nms_thresh=nms_thresh)[0] for y,prob_dist in zip(Y,Yhat)]
+                stats = matching_dataset(Y, Y_instances, thresh=iou_threshs, show_progress=False, parallel=True)
+                values[prob_thresh] = value = np.mean([s._asdict()[measure] for s in stats])
+            if verbose > 1:
+                print("{now}   thresh: {prob_thresh:f}   {measure}: {value:f}".format(
+                    now = datetime.datetime.now().strftime('%H:%M:%S'),
+                    prob_thresh = prob_thresh,
+                    measure = measure,
+                    value = value,
+                ), flush=True)
+            else:
+                progress.update()
+                progress.set_postfix_str("{prob_thresh:.3f} -> {value:.3f}".format(prob_thresh=prob_thresh, value=value))
+                progress.refresh()
+            return -value
+
+        opt = minimize_scalar(fn, method='golden', bracket=bracket, tol=tol, options={'maxiter': maxiter})
+
+    verbose > 1 and print('\n',opt, flush=True)
+    return opt.x, -opt.fun

@@ -3,6 +3,7 @@ from setuptools import setup, find_packages, Extension
 from setuptools.command.build_ext import build_ext
 from numpy.distutils.misc_util import get_numpy_include_dirs
 from os import path
+from glob import glob
 
 
 class build_ext_openmp(build_ext):
@@ -35,13 +36,17 @@ class build_ext_openmp(build_ext):
             super(build_ext_openmp, self).build_extension(ext)
 
 
-_dir = path.abspath(path.dirname(__file__))
+# cf. https://github.com/mkleehammer/pyodbc/issues/82#issuecomment-231561240
+_dir = path.dirname(__file__)
 
 with open(path.join(_dir,'stardist','version.py')) as f:
     exec(f.read())
 
 with open(path.join(_dir,'README.md')) as f:
     long_description = f.read()
+
+qhull_root = path.join(_dir, 'stardist', 'lib', 'qhull_src', 'src')
+qhull_src = sorted(glob(path.join(qhull_root, '*', '*.c*')))[::-1]
 
 
 setup(
@@ -60,11 +65,20 @@ setup(
     cmdclass={'build_ext': build_ext_openmp},
     ext_modules=[
         Extension(
-            'stardist.lib.stardist',
-            sources=['stardist/lib/stardist.cpp','stardist/lib/clipper.cpp'],
+            'stardist.lib.stardist2d',
+            sources=['stardist/lib/stardist2d.cpp','stardist/lib/clipper.cpp'],
+            extra_compile_args = ['-std=c++11'],
             include_dirs=get_numpy_include_dirs(),
-        )
+        ),
+        Extension(
+            'stardist.lib.stardist3d',
+            sources=['stardist/lib/stardist3d.cpp'] + qhull_src,
+            extra_compile_args = ['-std=c++11'],
+            include_dirs=get_numpy_include_dirs() + [qhull_root],
+        ),
     ],
+
+    package_data={'stardist': ['kernels/*.cl']},
 
     classifiers=[
         'Development Status :: 4 - Beta',
@@ -74,10 +88,12 @@ setup(
 
         'Programming Language :: Python :: 3.5',
         'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
     ],
 
     install_requires=[
-        "csbdeep",
-        "scikit-image",
+        'csbdeep>=0.4.0',
+        'scikit-image',
+        'numba',
     ],
 )
