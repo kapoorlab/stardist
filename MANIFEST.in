@@ -1,2 +1,2 @@
-include stardist/lib/*.hpp
-recursive-include stardist/lib/qhull_src *.txt *.h *.c *.cpp
+recursive-include stardist/lib/ *.txt *.c *.cpp *.h *.hpp
+include pyproject.toml
